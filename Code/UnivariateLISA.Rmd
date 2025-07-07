@@ -1,0 +1,578 @@
+---
+title: "univariate LISA"
+output: html_document
+date: "2025-05-22"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+# Load libraries
+library(dplyr)
+library(sf)
+library(dplyr)
+library(readr)
+library(tidycensus)
+library(spdep)
+library(tmap)
+library(rgeoda)
+```
+
+```{r}
+# Set working directory
+setwd("")
+
+df <- read_csv('County_every5_CareScore.csv') 
+
+df$GEOID <- sprintf("%05s",df$GEOIDCN)
+
+
+# Dataset of US counties with Alaska and Hawaii shifted and re-scaled
+data(county_laea)
+st_crs(county_laea) <- st_crs("+proj=laea +lat_0=45 +lon_0=-100 +x_0=0 +y_0=0 +a=6370997 +b=6370997 +units=m +no_defs")
+
+```
+
+```{r}
+dfmap<-left_join(county_laea, df)%>%
+  drop_na(combined_score_health)
+```
+
+```{r}
+dfmap.county <- as(dfmap, "Spatial")
+neighbors <- poly2nb(dfmap.county, queen=TRUE)
+neighbor.weight <- nb2listw(neighbors,zero.policy=TRUE)
+```
+
+```{r}
+match_palette <- function(patterns, classifications, colors){
+  classes_present <- base::unique(patterns)
+  mat <- matrix(c(classifications,colors), ncol = 2)
+  logi <- classifications %in% classes_present
+  pre_col <- matrix(mat[logi], ncol = 2)
+  pal <- pre_col[,2]
+  return(pal)
+}
+
+lisa_map <- function(df, lisa, alpha = .05) {
+  clusters <- lisa_clusters(lisa,cutoff = alpha)
+  labels <- lisa_labels(lisa)
+  pvalue <- lisa_pvalues(lisa)
+  colors <- lisa_colors(lisa)
+  lisa_patterns <- labels[clusters+1]
+
+  pal <- match_palette(lisa_patterns,labels,colors)
+  labels <- labels[labels %in% lisa_patterns]
+
+  df["lisa_clusters"] <- clusters
+  tm_shape(df) +
+    tm_fill("lisa_clusters",labels = labels, palette = pal,style = "cat",title = "LISA Clusters")
+}
+
+significance_map <- function(df, lisa, permutations = 999, alpha = .05) {
+  pvalue <- lisa_pvalues(lisa)
+  target_p <- 1 / (1 + permutations)
+  potential_brks <- c(.00001, .0001, .001, .01)
+  brks <- potential_brks[which(potential_brks > target_p & potential_brks < alpha)]
+  brks2 <- c(target_p, brks, alpha)
+  labels <- c(as.character(brks2), "Not Significant")
+  brks3 <- c(0, brks2, 1)
+  
+  cuts <- cut(pvalue, breaks = brks3,labels = labels)
+  df["sig"] <- cuts
+  
+  pal <- rev(brewer.pal(length(labels), "Greens"))
+  pal[length(pal)] <- "# D3D3D3"
+  
+  tm_shape(df) +
+    tm_fill("sig", palette = pal)
+}
+```
+
+```{r}
+dfmap.county.sf <- st_as_sf(dfmap.county)
+
+w <- queen_weights(dfmap.county.sf)
+lisa <- local_moran(w, dfmap.county.sf['combined_score_health'])
+
+# Plot
+lisa_map(dfmap.county.sf, lisa) +
+  tm_shape(dfmap.county.sf) + tm_borders(lwd = 0.5, col = "gray50") +
+  tm_shape(county_laea) + tm_borders(lwd = 0.5, col = "gray50") +
+  tm_layout(
+    title = "",
+    legend.outside = TRUE,
+    frame = FALSE,            # Removes plot window border
+    legend.frame = FALSE      # Removes legend box
+  )
+
+```
+
+
+# making for all the category
+```{r}
+library(tmap)
+library(sf)
+library(spdep)
+library(dplyr)
+library(tmap)
+library(readr)
+
+# Set working directory
+setwd("")
+
+yeargroup <- c("2009–2013", "2014–2018", "2019–2021")
+# Load and format data
+df <- read_csv(' County_every5_CareScore.csv') %>%filter(Year_Group==yeargroup[3])
+df$GEOID <- sprintf("%05s", df$GEOIDCN)
+
+# Load county shape (with LAEA projection)
+data(county_laea)
+st_crs(county_laea) <- st_crs("+proj=laea +lat_0=45 +lon_0=-100 +x_0=0 +y_0=0 +a=6370997 +b=6370997 +units=m +no_defs")
+
+# Join attribute data
+dfmap <- left_join(county_laea, df, by = "GEOID")
+
+
+```
+
+```{r}
+match_palette <- function(patterns, classifications, colors){
+  classes_present <- base::unique(patterns)
+  mat <- matrix(c(classifications,colors), ncol = 2)
+  logi <- classifications %in% classes_present
+  pre_col <- matrix(mat[logi], ncol = 2)
+  pal <- pre_col[,2]
+  return(pal)
+}
+
+lisa_map <- function(df, lisa, alpha = .05, show_legend = TRUE) {
+  clusters <- lisa_clusters(lisa, cutoff = alpha)
+  labels <- lisa_labels(lisa)
+  colors <- lisa_colors(lisa)
+  lisa_patterns <- labels[clusters + 1]
+
+  pal <- match_palette(lisa_patterns, labels, colors)
+  labels <- labels[labels %in% lisa_patterns]
+
+  df$lisa_clusters <- clusters
+
+  tm_shape(df) +
+    tm_fill("lisa_clusters",
+            labels = labels,
+            palette = pal,
+            style = "cat",
+            title = if (show_legend) "LISA Clusters" else NULL,
+            legend.show = show_legend) +
+    tm_shape(df) + tm_borders(lwd = 0.2, col = "gray50") +
+    tm_shape(county_laea) + tm_borders(lwd = 0.2, col = "gray50") +
+    tm_layout(
+      title = "",
+      frame = FALSE,
+      legend.frame = FALSE,
+      legend.outside = show_legend
+    )
+}
+
+```
+
+```{r}
+
+# Variables to analyze
+target_vars <- c("combined_score_health", "combined_score_educ", "combined_score_others")
+titles <- c("(g)", "(h)", "(i)") # health, education, others
+
+# Create maps
+map_list <- lapply(seq_along(target_vars), function(i) {
+  var <- target_vars[i]
+  title_txt <- titles[i]
+
+  df_filtered <- dfmap %>% drop_na(!!sym(var))
+  df_sf <- st_as_sf(df_filtered)
+  w <- queen_weights(df_sf)
+  lisa <- local_moran(w, df_sf[var])
+
+  # Show legend only for the first map
+  lisa_map(df_sf, lisa, show_legend = (i == 3)) + 
+    tm_legend(
+      position =  c(0.8, 0.5), # tm_pos_out("bottom", "center"),
+      title = "LISA Clusters", stack="horizontal",
+      legend.outside.position = "bottom",
+            component.autoscale = FALSE, ,legend.outside = TRUE)+
+    tm_layout(title = title_txt, title.position =  c(0.2,1),legend.outside.size = 0.35)
+})
+
+
+
+```
+
+```{r}
+# Combine plots into one figure
+# Arrange vertically (one map has the legend)
+combined_plot <- tmap_arrange(
+  map_list[[1]],
+  map_list[[2]],
+  map_list[[3]],
+  ncol = 1
+) 
+# combined_plot
+# Save the plot
+tmap_save(
+  combined_plot,
+  filename = paste("GINI Paper/Draft/Figures/univariate_LISA_combined_cluster_map_",yeargroup[3],".png",sep=""),
+  width = 10,
+  height = 12,
+  units = "in",
+  dpi = 300
+)
+
+```
+
+
+
+# calculating LISA for every year
+```{r}
+library(dplyr)
+library(sf)
+library(spdep)
+library(stringr)
+library(tidyr)
+
+df<- reatidyrdf<- read.csv('County_everyyear_CareScore.csv')
+df$GEOID <- sprintf("%05s", df$GEOIDCN)
+```
+
+# Morans'I
+```{r}
+# Function to compute Global Moran's I
+compute_global_moran <- function(dfmap, value_col) {
+  dfmap <- dfmap %>% drop_na(.data[[value_col]])
+  
+  if (nrow(dfmap) < 10) return(NULL)  # Skip if too few observations
+
+  # Convert to Spatial
+  dfmap_spatial <- as(dfmap, "Spatial")
+  
+  # Create neighbors and weights
+  neighbors <- poly2nb(dfmap_spatial, queen = TRUE)
+  lw <- nb2listw(neighbors, style = "W", zero.policy = TRUE)
+
+  # Extract values
+  values <- dfmap[[value_col]]
+  values[is.na(values)] <- median(values, na.rm = TRUE)
+
+  # Compute global Moran's I
+  mi <- moran.test(values, lw, zero.policy = TRUE)
+  
+  result <- data.frame(
+    Year = unique(dfmap$Year),
+    Variable = value_col,
+    Moran_I = mi$estimate["Moran I statistic"],
+    P_value = mi$p.value
+  )
+  return(result)
+}
+
+# Initialize a list to store results
+global_moran_results <- list()
+
+# Loop through variables and years
+for (var in vars) {
+  for (yr in 2009:2021) {
+    message("Global Moran's I for ", var, " in ", yr)
+    
+    df_year <- df %>% filter(Year == yr)
+    dfmap <- left_join(county_sf, df_year, by = "GEOID")
+    
+    moran_result <- compute_global_moran(dfmap, var)
+    if (!is.null(moran_result)) {
+      global_moran_results[[paste(var, yr, sep = "_")]] <- moran_result
+    }
+  }
+}
+
+# Combine all results
+# Format Moran's I and P-value columns
+formatted_moran_df <- global_moran_df %>%
+  mutate(
+    Moran_I = round(Moran_I, 2),
+    P_value = case_when(
+      P_value < 0.01 ~ "<0.01",
+      P_value < 0.05 ~ "<0.05",
+      TRUE ~ as.character(round(P_value, 2))
+    )
+  )
+
+# Print result
+print(formatted_moran_df)
+
+
+# Save to CSV
+write.csv(formatted_moran_df, "GINI Paper/Draft/Tables/global_moran_results_2009_2021.csv", row.names = FALSE)
+
+```
+
+# LISA
+```{r}
+
+# LISA computation function per year, dynamically creating neighbors
+compute_lisa_clusters <- function(df_year, value_col, alpha = 0.05) {
+  # Convert to spatial
+  dfmap <- df_year %>% drop_na({{ value_col }})
+  dfmap_spatial <- as(dfmap, "Spatial")
+
+  # Calculate neighbors and weights
+  neighbors <- poly2nb(dfmap_spatial, queen = TRUE)
+  lw <- nb2listw(neighbors, style = "W", zero.policy = TRUE)
+
+  # Extract values
+  values <- dfmap[[value_col]]
+  values[is.na(values)] <- median(values, na.rm = TRUE)  # handle any remaining NAs
+
+  # Compute local Moran's I
+  lisa <- localmoran(values, lw, zero.policy = TRUE)
+
+  # Define cluster categories
+  clusters <- factor(
+    case_when(
+      lisa[, 5] >= alpha ~ "Not Significant",
+      values >= mean(values, na.rm = TRUE) & lag.listw(lw, values) >= mean(values, na.rm = TRUE) ~ "High-High",
+      values <= mean(values, na.rm = TRUE) & lag.listw(lw, values) <= mean(values, na.rm = TRUE) ~ "Low-Low",
+      values >= mean(values, na.rm = TRUE) & lag.listw(lw, values) <= mean(values, na.rm = TRUE) ~ "High-Low",
+      values <= mean(values, na.rm = TRUE) & lag.listw(lw, values) >= mean(values, na.rm = TRUE) ~ "Low-High",
+      TRUE ~ "Other"
+    ),
+    levels = c("High-High", "Low-Low", "High-Low", "Low-High", "Not Significant", "Other")
+  )
+
+  return(data.frame(GEOID = dfmap$GEOID, Year = dfmap$Year[1], cluster = clusters))
+}
+
+# Loop through years and compute LISA for each year
+run_lisa_all_years <- function(df, value_col, county_shapefile) {
+  all_lisa_results <- list()
+
+  for (yr in 2009:2021) {
+    message("Processing year: ", yr)
+    
+    df_year <- df %>% filter(Year == yr)
+    
+    # Join with spatial geometry
+    dfmap <- left_join(county_shapefile, df_year, by = "GEOID")
+    dfmap <- dfmap %>% filter(!is.na(.data[[value_col]]))
+
+    if (nrow(dfmap) < 10) {
+      warning("Too few counties with data for year ", yr, "; skipping.")
+      next
+    }
+
+    # Compute LISA
+    lisa_result <- compute_lisa_clusters(dfmap, value_col)
+    all_lisa_results[[as.character(yr)]] <- lisa_result
+  }
+
+  final_result <- bind_rows(all_lisa_results)
+  return(final_result)
+}
+
+# ----------------------------
+# Load and prepare shapefile
+# ----------------------------
+county_sf <- st_read('GINI Paper/Data/cb_2010_us_county_500k/gz_2010_us_050_00_500k.shp')
+
+county_sf <- county_sf %>%
+  mutate(GEOID = str_pad(STATE, 2, pad = "0") %>% paste0(str_pad(COUNTY, 3, pad = "0"))) %>%
+  st_transform(crs = 4326)
+
+# ----------------------------
+# Run LISA and export
+# ----------------------------
+# Replace df with your actual full dataset
+vars<- c("combined_score_health","combined_score_educ","combined_score_others") {
+    final_lisa_df <- run_lisa_all_years(df, var, county_sf)
+  
+  # Save result
+  write.csv(final_lisa_df, paste("GINI Paper/Data/LISA_", var,"_2009_2021.csv",sep=""), row.names = FALSE)
+  
+}
+
+```
+
+# waffle map for each LISA result (Figure 5)
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(waffle)
+library(ggthemes)
+
+# ----------------------------
+# Load LISA CSVs
+# ----------------------------
+vars <- c("combined_score_health", "combined_score_educ", "combined_score_others")
+names(vars) <- c("Health", "Education", "Daily living")
+
+# Function to process each file and count clusters
+process_lisa_csv <- function(var_name, label_name) {
+  file_path <- paste0("GINI Paper/Data/LISA_", var_name, "_2009_2021.csv")
+  df <- read.csv(file_path)
+  
+  df %>%
+    count(Year, cluster) %>%
+    mutate(Category = label_name)
+}
+
+# Combine all three into one tidy dataframe
+waffle_data <- bind_rows(lapply(seq_along(vars), function(i) {
+  process_lisa_csv(vars[i], names(vars)[i])
+}))
+
+# Optional: reorder clusters for consistent display
+waffle_data$cluster <- factor(waffle_data$cluster,
+  levels = c("High-High", "Low-Low", "High-Low", "Low-High", "Not Significant", "Other")
+)
+
+# ----------------------------
+# Create the waffle plot
+# ----------------------------
+library(waffle)
+library(ggplot2)
+
+waffle_data_scaled <- waffle_data %>%
+  mutate(n_scaled = round(n / 10)) %>%
+  filter(n_scaled > 0)
+
+p1<- waffle_data_scaled%>%filter(cluster!="Not Significant")%>%
+  ggplot(aes(fill = cluster, values = n_scaled)) +
+  geom_waffle(n_rows = 10, color = "white", size = 0.1) +
+  facet_grid(Category ~ Year, switch = "y") +
+  scale_fill_manual(
+    values = c(
+      "High-High" = "# ff0000",         # Red
+      "Low-Low" = "# 0000ff",           # Blue
+      "High-Low" = "# ffb6c1",          # Light pink
+      "Low-High" = "# add8e6",          # Light blue
+      "Not Significant" = "# d3d3d3"    # Light gray
+    ),
+    name = "LISA Cluster"
+  ) +
+  theme_minimal(base_size = 8) +
+  theme(
+    panel.grid = element_blank(),
+    strip.text.y = element_text(angle = 0),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    axis.title = element_blank(),
+    legend.position = "bottom"
+  )
+write.csv(waffle_data_scaled,'GINI Paper/Draft/Tables/LISAtimeserise.csv',row.names = FALSE)
+
+ggsave('GINI Paper/Draft/Figures/univariate_LISA_combined_cluster_timeseries.png',dpi=300, units = "cm",width=12, height = 6)
+
+```
+
+# waffle for rural and urban
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(waffle)
+library(ggthemes)
+library(readr)
+
+
+# Load RUCC data and pad GEOID as 5-digit string
+rural <- read_csv('ruralurbancodes2013.csv') %>%
+  mutate(GEOID = sprintf("%05d", FIPS)) %>%
+  select(GEOID, RUCC_2013)
+
+
+# Function to process each LISA CSV and attach RUCC code
+process_lisa_with_rucc <- function(var_name, label_name) {
+  file_path <- paste0("GINI Paper/Data/LISA_", var_name, "_2009_2021.csv")
+  df <- read_csv(file_path) %>%
+    mutate(GEOID = sprintf("%05s", GEOID)) %>%
+    left_join(rural, by = "GEOID") %>%
+    count(RUCC_2013, cluster) %>%
+    group_by(RUCC_2013) %>%
+    mutate(percentage = n / sum(n) * 100,
+           n_scaled = round(percentage)) %>%  # scale to 100 total units per RUCC
+    mutate(Category = label_name) %>%
+    ungroup()
+}
+
+# Process each dataset (Health, Education, Others)
+vars <- c("combined_score_health", "combined_score_educ", "combined_score_others")
+names(vars) <- c("Health", "Education", "Daily living")
+
+waffle_data <- bind_rows(lapply(seq_along(vars), function(i) {
+  process_lisa_with_rucc(vars[i], names(vars)[i])
+}))
+
+# Reorder cluster categories
+waffle_data$cluster <- factor(waffle_data$cluster,
+  levels = c("High-High", "Low-Low", "High-Low", "Low-High", "Not Significant", "Other")
+)
+
+# Filter out Not Significant (optional)
+waffle_data_filtered <- waffle_data %>% filter(cluster != "Not Significant", !is.na(RUCC_2013))
+rucc_labels <- c(
+  "1" = "Metro ≥1M",
+  "2" = "Metro 250K–1M",
+  "3" = "Metro <250K",
+  "4" = "Urban Adjacent",
+  "5" = "Urban Non-Adjacent",
+  "6" = "Small Town Adjacent",
+  "7" = "Small Town Non-Adjacent",
+  "8" = "Rural Adjacent",
+  "9" = "Rural Remote"
+)
+
+waffle_data_filtered <- waffle_data_filtered %>%
+  mutate(RUCC_label = factor(as.character(RUCC_2013), levels = names(rucc_labels), labels = rucc_labels))
+
+# Create waffle plot
+p2<- waffle_data_filtered %>%
+  ggplot(aes(fill = cluster, values = n_scaled)) +
+  geom_waffle(n_rows = 10, color = "white", size = 0.1) +
+  facet_grid(Category ~ RUCC_label, switch = "y") +
+  scale_fill_manual(
+    values = c(
+      "High-High" = "# ff0000",
+      "Low-Low" = "# 0000ff",
+      "High-Low" = "# ffb6c1",
+      "Low-High" = "# add8e6",
+      "Not Significant" = "# d3d3d3"
+    ),
+    name = "LISA Cluster"
+  ) +
+  theme_minimal(base_size = 8) +
+  theme(
+    panel.grid = element_blank(),
+    strip.text.y = element_text(angle = 0),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    axis.title = element_blank(),
+    legend.position = "bottom"
+  )
+
+write.csv(waffle_data_filtered,'GINI Paper/Draft/Tables/LISAurbanrural.csv',row.names = FALSE)
+
+
+waffle_data_filtered%>%filter(RUCC_label =="Metro ≥1M")%>%filter(cluster =="High-High")
+ggsave('GINI Paper/Draft/Figures/univariate_LISA_combined_cluster_by_rural_urban.png',dpi=300, units = "cm",width=12, height = 6)
+
+```
+
+# combine 
+```{r}
+library(patchwork)
+combined_plot <- p1 + p2 + plot_layout(ncol = 1, guides = "collect") & theme(legend.position = "bottom") 
+combined_plot +    plot_annotation(tag_levels = 'a', tag_prefix = "(", tag_suffix = ")")
+
+ggsave("GINI Paper/Draft/Figures/combined_waffle_plot.png", combined_plot, width =10, height = 5, dpi = 300)
+
+```
+
+
