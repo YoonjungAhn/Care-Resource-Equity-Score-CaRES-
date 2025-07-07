@@ -1,0 +1,1051 @@
+---
+title: "gini coefficient"
+output: html_document
+date: "2025-03-19"
+editor_options: 
+  chunk_output_type: console
+---
+```{r}
+library(dplyr)
+library(DescTools)
+library(lctools)
+library(tidycensus)
+```
+
+# total population
+```{r}
+
+options(tigris_use_cache = TRUE)
+years <- c(2009:2023) # 2009 
+# Initialize an empty dataframe to store results
+
+total_pop_data <- data.frame()
+# Loop through each year and state
+for (year in years) {
+  for (state_code in  state.abb) {
+    message(paste("Fetching data for", state_code, "in", year))
+    
+    # Try to fetch the data (wrap in tryCatch in case a year/state has issues)
+    tryCatch({
+      totalpop <- get_acs(
+        geography = "tract", 
+        variables = "B01001_001E", 
+        state = state_code,
+        year = year, 
+        survey = "acs5", 
+        output = "wide"
+      )
+      
+      # Add year and state as columns
+      totalpop$Year <- year
+      totalpop$State <- state_code
+      
+      # Append to the main dataframe
+      total_pop_data <- bind_rows(total_pop_data, totalpop)
+    }, error = function(e) {
+      warning(paste("Failed for", state_code, "in", year, ":", e$message))
+    })
+  }
+}
+
+
+# Check the resulting dataframe
+total_pop_data<- total_pop_data%>%select(-c("B01001_001M"))%>%  rename(total_pop=B01001_001E,year = Year)
+write.csv(total_pop_data,'GINI Paper/Data/Tractlevel_totalpop_acs_2009_2023.csv', row.names=FALSE)
+```
+
+
+# employment  (need to redo it at census tract level)
+```{r}
+# population data block group level
+total_pop_data <- read.csv('Tractlevel_totalpop_acs_2009_2023.csv')
+total_pop_data$GEOID <- sprintf("%011s",total_pop_data$GEOID)
+
+# employment data block level
+df <- read.csv('GiniData.csv')%>%  rename(Others=Accommodation...Food.Services,BlockGEOID= w_geocode, State=state)%>%select(-c(X))
+
+# capitalizing state abb 
+df$State<- toupper(df$State) 
+
+# chaing block group code to have a leading zero
+df$BlockGEOID<- sprintf("%015.0f", as.numeric(df$BlockGEOID))
+
+# extracting 11 digits which indicates census tract level
+df$GEOID <- substr(df$BlockGEOID, 1, 11)
+
+# group by to census block group level
+DF <- df %>%
+  group_by(GEOID, year) %>%
+  summarise(
+    Educational_Services = sum(Educational.Services, na.rm = TRUE),
+    Health_Care = sum(Health.Care, na.rm = TRUE),
+    Others = sum(Others, na.rm = TRUE),
+    .groups = 'drop'
+  )%>%filter(year>=2009)%>%full_join(total_pop_data)%>%select(-c("NAME")) # Filter rows based on condition
+
+
+write.csv(DF,'GINI Paper/Data/Tractlevel_Employment_By_Industry_withTotalpop_2009_2023.csv', row.names=FALSE)
+```
+
+# calculating gini
+```{r}
+# Extract first 11 digits (Census tract)
+DFfilter$tract_GEOID <- substr(DFfilter$GEOID, 1, 11)
+
+# Count unique tracts
+n_unique_tracts <- length(unique(DFfilter$tract_GEOID))
+print(n_unique_tracts)
+```
+
+# Code with Parallel Processing
+```{r}
+library(foreach)
+library(doParallel)
+
+DF <- read.csv('Tractlevel_Employment_By_Industry_withTotalpop_2009_2023.csv')
+DF$GEOID <- sprintf("%011s", DF$GEOID)
+DF$GEOIDCN<-  substr(DF$GEOID, 1, 5)
+
+# Filter rows based on condition
+# Define the types of interest
+types <- c("Health_Care", "Educational_Services", "Others")
+counties <- unique(DF$GEOIDCN)
+
+# Ensure 'year' is numeric if not already converted
+DF$year <- as.numeric(DF$year)
+unique_years <- unique(DF$year)
+
+# make it as a long table
+DF_long <- as.data.frame(DF) %>%
+  pivot_longer(
+    cols = c(Educational_Services, Health_Care, Others),
+    names_to = "TYPE",
+    values_to = "IndustryEmployment"
+  )%>%
+  mutate(total_pop = ifelse(is.na(total_pop), 0, total_pop))%>%
+  mutate(IndustryEmployment = ifelse(is.na(IndustryEmployment), 0, IndustryEmployment))
+
+
+# Set up parallel backend
+num_cores <- parallel::detectCores() - 4  # Leave 1 core free
+cl <- makeCluster(num_cores)
+registerDoParallel(cl)
+
+# Create a dataframe with all combinations
+combo_df <- expand.grid(
+  Year = unique_years,
+  Type = types,
+  County = counties
+) # Filter rows based on condition
+
+
+# Initialize an empty dataframe to store results
+gini_results <- data.frame(County = character(), Year = integer(), Type = character(), Gini = numeric(),lwr.ci =numeric(),   upr.ci=numeric(),  stringsAsFactors = FALSE)
+
+
+# Run parallel processing
+gini_results <- foreach(i = 1:nrow(combo_df), .combine = rbind, .packages = c("dplyr", "DescTools")) %dopar% {
+  current_year <- combo_df$Year[i]
+  type <- combo_df$Type[i]
+  county <- combo_df$County[i]
+
+  # Filter the data
+  DFfilter <- DF_long %>%
+    filter(year == current_year, TYPE == type, GEOIDCN == county) %>%
+    filter(!is.na(IndustryEmployment), !is.na(total_pop), total_pop != 0)
+
+# Safeguard for empty or invalid data
+  if (!is.null(DFfilter) && nrow(DFfilter) > 1 && all(c("IndustryEmployment", "total_pop") %in% names(DFfilter))) {
+    gini_value <- tryCatch(
+      {
+        Gini(weights = DFfilter$total_pop, DFfilter$IndustryEmployment,  unbiased = FALSE) # Filter rows based on condition
+      },
+      error = function(e) {
+        c(NA, NA, NA)
+      }
+    )
+  } else {
+    gini_value <- c(NA, NA, NA)
+  }
+
+  # Return the result row
+  data.frame(
+    GEOIDCN = county,
+    Year = current_year,
+    Type = type,
+    Gini = gini_value[1],
+    lwr.ci = gini_value[2],
+    upr.ci = gini_value[3],
+    stringsAsFactors = FALSE
+  )
+}
+
+# Stop parallel cluster
+stopCluster(cl)
+
+# View and reshape
+print(gini_results)
+
+gini_results_wide <- gini_results %>%
+  tidyr::pivot_wider(
+    id_cols = c(GEOIDCN, Year), 
+    names_from = Type, 
+    values_from = Gini
+  ) %>%
+  filter(Year != 2024)
+
+print(gini_results_wide)
+
+write.csv(gini_results_wide,'GINI Paper/Data/County_gini_coefficient.csv', row.names=FALSE)
+```
+
+# visualization
+```{r}
+library(ggplot2)
+library(geofacet)
+library(fmsb)
+library(tidycensus)
+```
+
+```{r}
+gini_results_wide <- read.csv('County_gini_coefficient.csv')
+gini_results_wide$GEOIDCN<-  sprintf("%05d", as.integer(gini_results_wide$GEOIDCN))
+
+gini_results_wide$State<-  substr(gini_results_wide$GEOIDCN, 1, 2)
+
+state_info<- fips_codes %>%
+  select(state, state_code) %>%
+  distinct() %>%
+  rename(
+    State_Abbreviation = state,
+    State = state_code
+  )
+
+
+
+```
+
+# geo facet map (Figure 3)
+```{r}
+library(tidyr)
+library(ggplot2)
+summarydf <- gini_results_wide %>%
+  left_join(state_info, by = "State") %>%
+  filter(!State %in% c("66", "72", "78")) %>%  # Filter rows based on condition
+  filter(!is.na(State_Abbreviation)) %>%
+  group_by(State, State_Abbreviation) %>%
+  summarise(
+    Health_Care = mean(Health_Care, na.rm = TRUE),
+    Educational_Services = mean(Educational_Services, na.rm = TRUE),
+    Others = mean(Others, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+summarydf_long <- summarydf %>%
+  pivot_longer(cols = c("Health_Care", "Educational_Services", "Others"), names_to = "Category", values_to = "Value")%>%group_by(State, Category, State_Abbreviation )%>%summarise(Meangini = mean(Value))
+
+ggplot(summarydf_long, aes(x = Category, y = Meangini, fill = Category)) +
+  geom_col(show.legend = FALSE, width = 0.7) +
+  facet_geo(~ State_Abbreviation, grid = "us_state_grid2") +  # Adjust grid as needed
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Statewise Comparison of Health Metrics", y = "Index Value", x = "")
+
+ggplot(summarydf_long, aes(x = Category, y = Meangini, fill = Category)) +
+  geom_bar(stat = "identity", show.legend = TRUE, width = 0.7) +  # Use geom_bar
+  coord_polar() +  # This converts the bar chart to a radial chart
+  facet_geo(~ State_Abbreviation, grid = "us_state_grid1") +  # Adjust grid as needed
+  theme_minimal() +
+  theme(axis.text.x = element_blank()) 
+  # labs(title = "Statewise Comparison of Health Metrics", y = "Index Value", x = "")
+```
+
+# timeserise (Figure 3)
+```{r}
+library(dplyr)
+library(tidyr)
+
+summarydf <- gini_results_wide %>%
+  left_join(state_info, by = "State") %>%
+  filter(!State %in% c("66", "72", "78")) %>%  # Filter rows based on condition
+  filter(!is.na(State_Abbreviation)) %>%
+  group_by(State, State_Abbreviation, Year) %>%
+  summarise(
+    Health_Care = mean(Health_Care, na.rm = TRUE),
+    Educational_Services = mean(Educational_Services, na.rm = TRUE),
+    Others = mean(Others, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+summarydf_long <- summarydf %>%
+  pivot_longer(
+    cols = c("Health_Care", "Educational_Services", "Others"),
+    names_to = "Category",
+    values_to = "Value"
+  ) %>%
+  mutate(Category = recode(Category,
+    "Health_Care" = "Health Care",
+    "Educational_Services" = "Educational Services",
+    "Others" = "Daily Living"
+  )) %>%
+  mutate(Category = factor(Category, levels = c("Daily Living", "Educational Services","Health Care" )))
+
+category_colors <- c(
+    "Daily Living" = "steelblue",
+    "Educational Services" = "firebrick",
+    "Health Care" = "forestgreen"
+)
+
+
+ggplot(summarydf_long, aes(x = Year, y = Value, color = Category, group = Category)) +
+  geom_line(size = 0.8) +
+  facet_geo(~ State_Abbreviation, grid = "us_state_grid1", scales = "free_x") +
+  scale_color_manual(values = category_colors) +
+  labs(
+    x = "Year",
+    y = "Value",
+    color = "Category"
+  ) +
+  scale_x_continuous(breaks = seq(2009, 2025, 5)) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(size = 12, angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 12),
+    axis.title = element_blank(),
+    legend.title = element_text(size = 14, face = "bold"),
+    legend.text = element_text(size = 12)
+  )
+
+
+
+ggsave('GINI Paper/Draft/Figures/County_gini_coefficient_timeseries.png',dpi=300, width = 13, height = 9)
+```
+
+
+# Location quotient
+```{r}
+library(dplyr)
+```
+
+```{r}
+df <- read.csv('GiniData.csv')%>%  rename(Others=Accommodation...Food.Services,BlockGEOID= w_geocode, State=state)%>%select(-c(X))
+# chaing block group code to have a leading zero
+df$BlockGEOID<- sprintf("%015.0f", as.numeric(df$BlockGEOID))
+df$GEOIDCN<-  substr(df$BlockGEOID, 1, 5)
+
+DF <- df %>%
+  group_by(GEOIDCN, year) %>%
+  summarise(
+    Educational_Services = sum(Educational.Services, na.rm = TRUE),
+    Health_Care = sum(Health.Care, na.rm = TRUE),
+    Others = sum(Others, na.rm = TRUE),
+    total_employment = sum(total_employment, na.rm=TRUE),
+    .groups = 'drop')
+  
+```
+
+```{r}
+calculate_lq <- function(df, industry_cols, region_col = "GEOIDCN", year_col = "year", total_col = "total_employment") {
+  library(dplyr)
+  
+  # Step 1: Calculate national totals (by year)
+  national_totals <- df %>%
+    group_by(across(all_of(year_col))) %>%
+    summarise(
+      across(all_of(industry_cols), sum, na.rm = TRUE),
+      nat_total = sum(.data[[total_col]], na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  # Step 2: Merge national totals into original data
+  df_lq <- df %>%
+    left_join(national_totals, by = year_col)
+  
+  # Step 3: Calculate Location Quotient for each industry
+  for (industry in industry_cols) {
+    industry_local <- paste0(industry, ".x")  # After join
+    industry_national <- paste0(industry, ".y")
+    
+    # Compute LQ using renamed columns
+    df_lq[[paste0("LQ_", industry)]] <- 
+      (df_lq[[industry_local]] / df_lq[[total_col]]) /
+      (df_lq[[industry_national]] / df_lq$nat_total)
+  }
+  
+  return(df_lq)
+}
+
+
+```
+
+```{r}
+# Your column names for industries
+industry_columns <- c("Educational_Services", "Health_Care", "Others")
+
+# Assuming your data is in a dataframe called `data`
+lq_data <- calculate_lq(DF, industry_columns )
+
+LQdat <- lq_data %>%select(c(GEOIDCN, year, LQ_Educational_Services, LQ_Health_Care, LQ_Others))%>% rename(Year=year )
+
+
+# write.csv(LQdat,'GINI Paper/Data/County_Location_Quotient.csv', row.names=FALSE)
+```
+
+# LQ geofacet (Figure 3)
+```{r}
+library(ggplot2)
+library(geofacet)
+library(fmsb)
+library(tidycensus)
+```
+
+```{r}
+LQdat <- read.csv('County_Location_Quotient.csv')
+
+LQdat$GEOIDCN<-  sprintf("%05d", as.integer(LQdat$GEOIDCN))
+
+
+state_info<- fips_codes %>%
+  select(state, state_code) %>%
+  distinct() %>%
+  rename(
+    State_Abbreviation = state,
+    State = state_code
+  )
+
+LQdat$State<-  substr(LQdat$GEOIDCN, 1, 2)
+
+
+
+summarydf <- LQdat %>%
+  left_join(state_info, by = "State") %>%
+  filter(!State %in% c("66", "72", "78")) %>%  # Filter rows based on condition
+  filter(!is.na(State_Abbreviation)) %>%
+  filter(Year>=2009)%>%
+  group_by(State,Year, State_Abbreviation) %>%
+  summarise(
+    Health_Care = mean(LQ_Health_Care, na.rm = TRUE),
+    Educational_Services = mean(LQ_Educational_Services, na.rm = TRUE),
+    Others = mean(LQ_Others, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+summarydf_long <- summarydf %>%
+  pivot_longer(
+    cols = c("Health_Care", "Educational_Services", "Others"),
+    names_to = "Category",
+    values_to = "Value"
+  ) %>%
+  mutate(Category = recode(Category,
+    "Health_Care" = "Health Care",
+    "Educational_Services" = "Educational Services",
+    "Others" = "Daily Living"
+  )) %>%
+    mutate(Category = factor(Category, levels = c("Daily Living", "Educational Services","Health Care" )))
+
+
+category_colors <- c(
+  "Health Care" = "forestgreen",
+  "Educational Services" = "firebrick",
+  "Daily Living" = "steelblue"
+)
+
+
+ggplot(summarydf_long, aes(x = Year, y = Value, color = Category, group = Category)) +
+  # geom_hline(yintercept = 1, linetype = "dashed", color = "black") +
+  geom_line(size= 0.8) +
+  facet_geo(~ State_Abbreviation, grid = "us_state_grid1", scales = "free_y") +
+  scale_color_manual(values = category_colors) +
+  labs(# title = "Trends by State and Category",
+       x = "Year",
+       y = "Value",
+       color = "Category") +
+  scale_x_continuous(breaks = seq(2009, 2025, 5), limits = c(2009, 2023)) +
+  theme_minimal() +
+    theme(
+      axis.text.x = element_text(size = 12, angle = 45, hjust = 1),
+      axis.text.y = element_text(size = 12),
+      axis.title = element_blank(),
+      legend.title = element_text(size = 14, face = "bold"),
+      legend.text = element_text(size = 12)
+    )
+
+
+ggsave('GINI Paper/Draft/Figures/County_LQ_timeseries.png',dpi=300, width = 13, height = 9)
+```
+
+# CARES temporal plot (Figure 3)
+```{r}
+library(dplyr)
+library(tidyr)
+
+care<- read.csv('County_everyyear_CareScore.csv')
+care$GEOIDCN<-  sprintf("%05d", as.integer(care$GEOIDCN))
+
+# Ensure GEOID is a 5-character string (just in case)
+care <- care %>%
+  mutate(GEOID = sprintf("%05s", GEOIDCN))
+
+# Extract state FIPS from county GEOID
+care <- care %>%
+  mutate(State = substr(GEOID, 1, 2))
+
+# Summarize to state-year level
+care_state_year <- care %>%
+  group_by(State, Year) %>%
+  summarise(
+    combined_score_health = mean(combined_score_health, na.rm = TRUE),
+    combined_score_educ = mean(combined_score_educ, na.rm = TRUE),
+    combined_score_others = mean(combined_score_others, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Add state abbreviations (assumes you have a lookup table)
+state_info <- state_info %>% mutate(State = as.character(State))  # Modify or create new variables
+
+care_state_year <- care_state_year %>%
+  left_join(state_info, by = "State")
+
+care_long <- care_state_year %>%
+  pivot_longer(
+    cols = starts_with("combined_score"),
+    names_to = "Category",
+    values_to = "Value"
+  ) %>%
+  mutate(
+    Category = recode(Category,
+      "combined_score_health" = "Health Care",
+      "combined_score_educ" = "Educational Services",
+      "combined_score_others" = "Daily Living"
+    )
+  )%>%  mutate(Category = factor(Category, levels = c("Daily Living", "Educational Services","Health Care" )))
+
+
+
+ggplot(care_long, aes(x = Year, y = Value, color = Category, group = Category)) +
+  geom_line(size = 0.8) +
+  facet_geo(~ State_Abbreviation, grid = "us_state_grid1", scales = "free_y") +
+  scale_color_manual(values = category_colors) +
+  labs(
+    x = "Year",
+    y = "Combined Score",
+    color = "Category"
+  ) +
+  scale_x_continuous(breaks = seq(2009, 2025, 5), limits = c(2009, 2023)) +
+  theme_minimal() +
+    theme(
+      axis.text.x = element_text(size = 12, angle = 45, hjust = 1),
+      axis.text.y = element_text(size = 12),
+      axis.title = element_blank(),
+      legend.title = element_text(size = 14, face = "bold"),
+      legend.text = element_text(size = 12)
+    )
+
+
+ggsave('GINI Paper/Draft/Figures/County_CARES_timeseries.png',dpi=300, width = 13, height = 9)
+```
+
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(cowplot)
+library(tidycensus)
+```
+
+```{r}
+LQdat<- read.csv('County_Location_Quotient.csv')
+LQdat$GEOIDCN <- sprintf("%05s", LQdat$GEOIDCN)
+
+gini_results <- read.csv('County_gini_coefficient.csv')
+gini_results$GEOIDCN <- sprintf("%05s", gini_results$GEOIDCN)
+
+# State abb
+state_info<- fips_codes %>%
+  select(state, state_code) %>%
+  distinct() %>%
+  rename(
+    State_Abbreviation = state,
+    GEOIDST = state_code
+  )
+
+DF<- left_join(gini_results, LQdat)
+
+DF$GEOIDST <-substr(DF$GEOIDCN, 1,2)
+DF <- left_join(DF,state_info)
+
+
+# write.csv(DF,'GINI Paper/Data/County_GINI_LQ.csv',row.names = FALSE)
+```
+
+# visualize gini vs LQ (Figure 2)
+```{r}
+DF <- read.csv('County_GINI_LQ.csv')
+DF$GEOIDCN <- sprintf("%05s",DF$GEOIDCN)
+
+years <- c(2009:2021)
+# Initialize an empty dataframe to store results
+conus_states <- state.abb # [!state.abb %in% c("AK", "HI")]
+
+total_pop_data <- data.frame()
+# Loop through each year and state
+for (year in years) {
+  totalpop <- get_acs(
+        geography = "county", 
+        variables = "B01001_001E", 
+        year = year, 
+        survey = "acs5", 
+        output = "wide"
+      )
+  # Add year and state as columns
+      totalpop$Year <- year
+
+            # Append to the main dataframe
+      total_pop_data <- bind_rows(total_pop_data, totalpop)
+}
+
+total_pop_data<- total_pop_data%>%select(GEOID,B01001_001E, Year)%>% rename(GEOIDCN=GEOID ,  totalpop=B01001_001E)
+```
+
+```{r}
+# Step 1: Compute ranges for x and y variables
+range_x <- range(0.3,0.85)
+range_y <- range(0,2, na.rm = TRUE)
+
+
+plot_lq_st <- function(data, x_var, y_var, x_limits = NULL, y_limits = NULL) {
+  data %>%
+    filter(Year > 2008, Year < 2022) %>%
+    group_by(GEOIDST, State_Abbreviation) %>%
+    summarise(
+      Educational_Services = mean(Educational_Services, na.rm = TRUE),
+      Health_Care = mean(Health_Care, na.rm = TRUE),
+      Others = mean(Others, na.rm = TRUE),
+      LQ_Educational_Services = mean(LQ_Educational_Services, na.rm = TRUE),
+      LQ_Health_Care = mean(LQ_Health_Care, na.rm = TRUE),
+      LQ_Others = mean(LQ_Others, na.rm = TRUE),
+      .groups = 'drop'
+    ) %>%
+    ggplot(aes_string(x = x_var, y = y_var, label = "State_Abbreviation")) +
+    geom_point(color = '# 2b8cbe', alpha = 0.6) +
+    ggrepel::geom_text_repel(size = 4, fontface = "bold", max.overlaps = Inf) +
+    geom_hline(yintercept = 1, linetype = "dashed", color = "# de2d26", linewidth = 1) +
+    geom_vline(xintercept = 0.5, linetype = "dotted", color = "# 636363", linewidth = 1) +
+    coord_cartesian(xlim = x_limits, ylim = y_limits) +
+    labs(x = "Gini Coefficient", y = "Location Quotient") +
+    theme_minimal() +
+    theme(
+      axis.title.x = element_text(size = 16, face = "bold"),
+      axis.title.y = element_text(size = 16, face = "bold"),
+      axis.text.x = element_text(size = 14, face = "bold"),
+      axis.text.y = element_text(size = 14, face = "bold")
+    )
+}
+
+# weighted pop
+range_x <- range(0.3,0.9)
+range_y <- range(0,2, na.rm = TRUE)
+
+
+plot_lq_st <- function(data, x_var, y_var, x_limits = NULL, y_limits = NULL) {
+  data %>%
+    filter(Year > 2012, Year < 2022) %>%
+    left_join(total_pop_data)%>%
+    group_by(GEOIDST, State_Abbreviation) %>%
+    summarise(
+      total_pop = sum(totalpop, na.rm = TRUE),
+      Educational_Services = mean(Educational_Services, na.rm = TRUE),
+      Health_Care = mean(Health_Care, na.rm = TRUE),
+      Others = mean(Others, na.rm = TRUE),
+      LQ_Educational_Services = weighted.mean(LQ_Educational_Services, totalpop, na.rm = TRUE),
+      LQ_Health_Care = weighted.mean(LQ_Health_Care,totalpop, na.rm = TRUE),
+      LQ_Others = weighted.mean(LQ_Others, totalpop, na.rm = TRUE),
+      .groups = 'drop'
+    ) %>%
+    ggplot(aes_string(x = x_var, y = y_var, label = "State_Abbreviation")) +
+    geom_point(color = '# 2b8cbe', alpha = 0.6) +
+    ggrepel::geom_text_repel(size = 4, fontface = "bold", max.overlaps = Inf) +
+    geom_hline(yintercept = 1, linetype = "dashed", color = "# de2d26", linewidth = 1) +
+    geom_vline(xintercept = 0.5, linetype = "dotted", color = "# 636363", linewidth = 1) +
+    coord_cartesian(xlim = x_limits, ylim = y_limits) +
+    labs(x = "Gini Coefficient", y = "Location Quotient") +
+    theme_minimal() +
+    theme(
+      axis.title.x = element_text(size = 16, face = "bold"),
+      axis.title.y = element_text(size = 16, face = "bold"),
+      axis.text.x = element_text(size = 14, face = "bold"),
+      axis.text.y = element_text(size = 14, face = "bold")
+    )    +
+    annotate("text", x = 0.75, y = 1.8, label = "High GINI – High LQ\n(Concentrated Access)", size = 4, fontface = "bold") +
+    annotate("text", x = 0.4, y = 1.8, label = "Low GINI – High LQ\n(Equitable Coverage)", size = 4, fontface = "bold") +
+    annotate("text", x = 0.75, y = 0.3, label = "High GINI – Low LQ\n(Unequal Scarcity)", size = 4, fontface = "bold") +
+    annotate("text", x = 0.4, y = 0.3, label = "Low GINI – Low LQ\n(Even Desert)", size = 4, fontface = "bold")
+
+}
+
+
+p1 <- plot_lq_st(DF,
+                 x_var = "Health_Care",
+                 y_var = "LQ_Health_Care",
+                 x_limits = range_x,
+                 y_limits = range_y)
+
+p2 <- plot_lq_st(DF,
+                 x_var = "Educational_Services",
+                 y_var = "LQ_Educational_Services",
+                 x_limits = range_x,
+                 y_limits = range_y)
+
+p3 <- plot_lq_st(DF,
+                 x_var = "Others",
+                 y_var = "LQ_Others",
+                 x_limits = range_x,
+                 y_limits = range_y)
+
+```
+
+```{r}
+range_x <- range(0,1)
+range_y <- range(0,8, na.rm = TRUE)
+
+
+plot_lq <- function(data, year_range, x_var, y_var,x_limits = NULL, y_limits = NULL) {
+  data %>%
+    filter(Year > year_range[1], Year < year_range[2]) %>%
+    ggplot(aes_string(x = x_var, y = y_var)) +
+    geom_point(color = '# 2b8cbe', alpha = 0.6) +
+    geom_hline(yintercept = 1, linetype = "dashed", color = "# de2d26", linewidth = 1) +
+    geom_vline(xintercept = 0.5, linetype = "dotted", color = "# 636363", linewidth = 1) +
+    coord_cartesian(xlim = x_limits, ylim = y_limits) +
+    labs(x ="Gini Coefficient", y = "Location Quotient") +
+    theme_minimal()+
+    theme(
+      axis.title.x = element_text(size = 16, face = "bold"),
+      axis.title.y = element_text(size = 16, face = "bold"),
+      axis.text.x = element_text(size = 14, face = "bold"),
+      axis.text.y = element_text(size = 14, face = "bold")
+    )+
+    annotate("text", x = 0.75, y = 7, label = "High GINI – High LQ\n(Concentrated Access)", size = 4, fontface = "bold") +
+    annotate("text", x = 0.2, y = 7, label = "Low GINI – High LQ\n(Equitable Coverage)", size = 4, fontface = "bold") +
+    annotate("text", x = 0.75, y = -0.7, label = "High GINI – Low LQ\n(Unequal Scarcity)", size = 4, fontface = "bold") +
+    annotate("text", x = 0.2, y = -0.7, label = "Low GINI – Low LQ\n(Even Desert)", size = 4, fontface = "bold")
+}
+
+
+
+p4<- plot_lq(DF, c(2008, 2022),
+        x_var = "Health_Care",
+        y_var = "LQ_Health_Care",
+        x_limits = range_x,
+                 y_limits = c(-2,8)) # range_y
+
+p5<- plot_lq(DF,  c(2008, 2022),
+        x_var = "Educational_Services",
+        y_var = "LQ_Educational_Services",
+        x_limits = range_x,
+                 y_limits = c(-2,8))
+
+p6<- plot_lq(DF,  c(2008, 2022),
+        x_var = "Others",
+        y_var = "LQ_Others",
+        x_limits = range_x,
+                 y_limits = c(-2,8))
+
+
+plot_grid(p1, p2, p3, p4, p5, p6,p7,
+          labels = c("(a)", "(b)", "(c)", "(d)", "(e)", "(f)","(g)"),
+          ncol = 3, nrow = 3)
+
+ggsave('GINI Paper/Draft/Figures/County_gini_coefficient.png',dpi=300, height = 30, width = 45, units = 'cm')
+```
+
+
+# color for urban  (Figure 2)
+```{r}
+# Ensure RUCC_2013 is treated as a factor with the correct labels
+
+# adding urbanicity
+urban <- read.csv('ruralurbancodes2013.csv')
+urban$GEOIDCN <-  sprintf("%05s",urban$FIPS)
+urban$RUCC_2013<- as.character(urban$RUCC_2013)
+
+DF<- DF%>%left_join(urban)
+
+rucc_labels <- c(
+  "1" = "Metro ≥1M",
+  "2" = "Metro 250K–1M",
+  "3" = "Metro <250K",
+  "4" = "Urban Adjacent",
+  "5" = "Urban Non-Adjacent",
+  "6" = "Small Town Adjacent",
+  "7" = "Small Town Non-Adjacent",
+  "8" = "Rural Adjacent",
+  "9" = "Rural Remote"
+)
+DF <- DF %>%
+  mutate(RUCC_2013 = factor(RUCC_2013, levels = names(rucc_labels), labels = rucc_labels))
+
+# Modified function with color by RUCC_2013
+plot_lq <- function(data, year_range, x_var, y_var, x_limits = NULL, y_limits = NULL) {
+  data %>%
+    filter(Year > year_range[1], Year < year_range[2]) %>%
+    ggplot(aes_string(x = x_var, y = y_var, color = "RUCC_2013")) +
+    geom_point(alpha = 0.6, size = 2) +
+    geom_hline(yintercept = 1, linetype = "dashed", color = "# de2d26", linewidth = 1) +
+    geom_vline(xintercept = 0.5, linetype = "dotted", color = "# 636363", linewidth = 1) +
+    coord_cartesian(xlim = x_limits, ylim = y_limits) +
+    labs(x = "Gini Coefficient", y = "Location Quotient", color = "Urbanicity") +
+    scale_color_manual(values = RColorBrewer::brewer.pal(n = 9, name = "Set1")) +
+    theme_minimal() +
+    theme(
+      axis.title.x = element_text(size = 16, face = "bold"),
+      axis.title.y = element_text(size = 16, face = "bold"),
+      axis.text.x = element_text(size = 14, face = "bold"),
+      axis.text.y = element_text(size = 14, face = "bold"),
+      legend.title = element_text(size = 14, face = "bold"),
+      legend.text = element_text(size = 12)
+    ) +
+    annotate("text", x = 0.75, y = 7, label = "High GINI – High LQ\n(Concentrated Access)", size = 4, fontface = "bold") +
+    annotate("text", x = 0.2, y = 7, label = "Low GINI – High LQ\n(Equitable Coverage)", size = 4, fontface = "bold") +
+    annotate("text", x = 0.75, y = -0.7, label = "High GINI – Low LQ\n(Unequal Scarcity)", size = 4, fontface = "bold") +
+    annotate("text", x = 0.2, y = -0.7, label = "Low GINI – Low LQ\n(Even Desert)", size = 4, fontface = "bold")
+}
+
+# Create plots
+p4 <- plot_lq(DF, c(2008, 2022), x_var = "Health_Care", y_var = "LQ_Health_Care", x_limits = range_x, y_limits = c(-2, 8))
+p5 <- plot_lq(DF, c(2008, 2022), x_var = "Educational_Services", y_var = "LQ_Educational_Services", x_limits = range_x, y_limits = c(-2, 8))
+p6 <- plot_lq(DF, c(2008, 2022), x_var = "Others", y_var = "LQ_Others", x_limits = range_x, y_limits = c(-2, 8))
+
+```
+
+ 
+# making urban and topology figure  (Figure 2)
+```{r}
+# making indicator
+
+# gini >0.5, LQ >1 : inequal_havg
+# gini >0.5, LQ <1 : inequal_lavg
+# gini <0.5, LQ >1 : equal_havg
+# gini <0.5, LQ <1 : equal_lavg
+# adding urbanicity
+urban <- read.csv('ruralurbancodes2013.csv')
+urban$GEOIDCN <-  sprintf("%05s",urban$FIPS)
+urban$RUCC_2013<- as.character(urban$RUCC_2013)
+
+DF<- DF%>%left_join(urban)
+
+rucc_labels <- c(
+  "1" = "Metro ≥1M",
+  "2" = "Metro 250K–1M",
+  "3" = "Metro <250K",
+  "4" = "Urban Adjacent",
+  "5" = "Urban Non-Adjacent",
+  "6" = "Small Town Adjacent",
+  "7" = "Small Town Non-Adjacent",
+  "8" = "Rural Adjacent",
+  "9" = "Rural Remote"
+)
+DF <- DF %>%
+  mutate(RUCC_2013 = factor(RUCC_2013, levels = names(rucc_labels), labels = rucc_labels))
+
+
+DFindex <- DF%>%
+  filter(Year > 2008, Year < 2022) %>%
+  mutate(
+    category_Educational = case_when(
+      Educational_Services > 0.5 & LQ_Educational_Services > 1 ~ "inequal_havg",
+      Educational_Services > 0.5 & LQ_Educational_Services < 1 ~ "inequal_lavg",
+      Educational_Services <= 0.5 & LQ_Educational_Services > 1 ~ "equal_havg",
+      Educational_Services <= 0.5 & LQ_Educational_Services < 1 ~ "equal_lavg",
+      TRUE ~ NA_character_
+    ),
+    category_Health = case_when(
+      Health_Care > 0.5 & LQ_Health_Care > 1 ~ "inequal_havg",
+      Health_Care > 0.5 & LQ_Health_Care < 1 ~ "inequal_lavg",
+      Health_Care <= 0.5 & LQ_Health_Care > 1 ~ "equal_havg",
+      Health_Care <= 0.5 & LQ_Health_Care < 1 ~ "equal_lavg",
+      TRUE ~ NA_character_
+    ),
+    category_Others = case_when(
+      Others > 0.5 & LQ_Others > 1 ~ "inequal_havg",
+      Others > 0.5 & LQ_Others < 1 ~ "inequal_lavg",
+      Others <= 0.5 & LQ_Others > 1 ~ "equal_havg",
+      Others <= 0.5 & LQ_Others < 1 ~ "equal_lavg",
+      TRUE ~ NA_character_
+    )
+  )
+```
+
+
+```{r}
+# Relabel and prep the data
+plot_df <-DFindex %>%
+  filter(!is.na(category_Educational), !is.na(RUCC_2013)) %>%
+  mutate(
+    typology_label = recode(category_Educational,
+      "inequal_havg" = "Concentrated Access",
+      "inequal_lavg" = "Unequal Scarcity",
+      "equal_havg"   = "Equitable Coverage",
+      "equal_lavg"   = "Even Desert"
+    )
+  ) %>%
+  group_by(Year, RUCC_2013, typology_label) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(Year, RUCC_2013) %>%
+  mutate(prop = n / sum(n))
+
+# Plot
+p7<-ggplot(plot_df, aes(x = Year, y = prop, fill = typology_label)) +
+  geom_bar(stat = "identity", position = "fill", width = 0.8) +
+  facet_wrap(~ RUCC_2013, ncol = 3) +
+    scale_y_continuous(labels = scales::percent_format()) +
+  scale_x_continuous(breaks = 2009:2021) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    title = "(g)",
+    x = "Year",
+    y = "Proportion of Counties",
+    fill = "Typology"
+  ) +
+  theme_minimal() +
+  scale_fill_manual(
+  values = c(
+    "Equitable Coverage" = "# b2df8a",  # light green
+    "Concentrated Access" = "# 1b7837", # dark green
+    "Even Desert" = "# bdbdbd",         # gray
+    "Unequal Scarcity" = "# 2166ac"     # dark blue
+  )
+)+
+  theme(
+    plot.title = element_text(hjust=0,face = "bold"),
+    strip.text = element_text(size = 13, face = "bold"),
+    axis.text.x = element_text(size = 12, angle = 45, hjust = 1,face = "bold"),
+    axis.text.y = element_text(size = 12, face = "bold"),
+
+    axis.title = element_text(size = 13, face = "bold"),
+    legend.text = element_text(size = 12),
+    legend.title = element_text(size = 13, face = "bold")
+  )
+
+
+P<- plot_grid(p1, p2, p3, p4, p5, p6,
+          labels = c("(a)", "(b)", "(c)", "(d)", "(e)", "(f)"),
+          ncol = 3, nrow = 2)
+
+Pall<-plot_grid(P, p7,ncol = 1, nrow = 2)
+
+ggsave( 'GINI Paper/Draft/Figures/County_gini_coefficient.png',dpi=300, height = 33, width = 45, units = 'cm')
+```
+
+# urbanicity topology by category (Supplementary)
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+# Reshape data into long format
+plot_df_long <- DFindex %>%
+  pivot_longer(
+    cols = starts_with("category_"),
+    names_to = "Service",
+    values_to = "Typology"
+  ) %>%
+  filter(!is.na(Typology), !is.na(RUCC_2013)) %>%
+  mutate(
+    # Clean up service names
+    Service = case_when(
+      Service == "category_Educational" ~ "Educational Services",
+      Service == "category_Health" ~ "Health Care",
+      Service == "category_Others" ~ "Daily Living"
+    ),
+    # Recode typologies to descriptive labels
+    Typology = recode(Typology,
+      "inequal_havg" = "Concentrated Access",
+      "inequal_lavg" = "Unequal Scarcity",
+      "equal_havg" = "Equitable Coverage",
+      "equal_lavg" = "Even Desert"
+    )
+  )
+
+# Summarize counts and proportions
+plot_df_summary <- plot_df_long %>%
+  group_by(Year, RUCC_2013, Service, Typology) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(Year, RUCC_2013, Service) %>%
+  mutate(prop = n / sum(n))
+
+p_typology_by_service <- ggplot(plot_df_summary, aes(x = Year, y = prop, fill = Typology)) +
+  geom_bar(stat = "identity", position = "fill", width = 0.8) +
+  facet_grid(RUCC_2013 ~ Service) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  scale_x_continuous(breaks = 2009:2021) +
+  scale_fill_manual(
+    values = c(
+      "Equitable Coverage" = "# b2df8a",      # light green
+      "Concentrated Access" = "# 1b7837",     # dark green
+      "Even Desert" = "# bdbdbd",             # gray
+      "Unequal Scarcity" = "# 2166ac"         # dark blue
+    )
+  ) +
+  labs(
+    title = "",
+    x = "Year",
+    y = "Proportion of Counties",
+    fill = "Typology"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0, face = "bold"),
+    strip.text = element_text(size = 1, face = "bold"),
+    axis.text.x = element_text(size = 18, angle = 45, hjust = 1, face = "bold"),# no
+    axis.text.y = element_text(size = 18, face = "bold"), # no
+    axis.title.x = element_text(size = 12, face = "bold"),  # x-axis label
+    axis.title.y = element_text(size = 20, face = "bold"),  # y-axis label (edited here)
+
+    legend.text = element_text(size = 18),
+    legend.title = element_text(size = 18, face = "bold"),
+    legend.position = "bottom",
+    legend.direction = "horizontal"
+  )
+
+
+ggsave( 'GINI Paper/Draft/Figures/Supplementary_topology_by_category.png',dpi=300, height = 60, width = 35, units = 'cm')
+```
+
+
+
+
+```{r}
+library(dplyr)
+library(tidyr)
+
+# Create a tidy version of the data by pivoting the category columns
+DF_tidy <- DFindex %>%
+  select(Year, State_Abbreviation, starts_with("category_")) %>%
+  pivot_longer(
+    cols = starts_with("category_"),
+    names_to = "Sector",
+    values_to = "Category"
+  ) %>%
+  mutate(Sector = recode(Sector,
+                         category_Educational = "Educational Services",
+                         category_Health = "Health Care",
+                         category_Others = "Daily Living"))
+
+# Count and calculate percentage per sector
+summary_table <- DF_tidy %>%
+  filter(!is.na(Category)) %>%
+  group_by(Sector, Category) %>%
+  summarise(Count = n(), .groups = "drop") %>%
+  group_by(Sector) %>%
+  mutate(Percentage = round(Count / sum(Count) * 100, 1)) %>%
+  arrange(Sector, desc(Count))
+
+# View the table
+print(summary_table)
+
+# Optional: save to CSV for supplementary materials
+write.csv(summary_table, "GINI Paper/Draft/Tables/Supplementary_Table_CaRES_Typology_countylevel.csv", row.names = FALSE)
+
+```
