@@ -1,0 +1,350 @@
+---
+title: "Score gini LQ"
+output: html_document
+date: "2025-05-21"
+editor_options: 
+  chunk_output_type: console
+---
+```{r}
+library(dplyr)
+library(ggplot2)
+```
+
+```{r}
+care <- read.csv('County_everyyear_CareScore.csv')
+care$GEOID <- sprintf("%05s",care$GEOIDCN)
+
+df<-read.csv('County_GINI_LQ.csv')
+df$GEOID <- sprintf("%05s",df$GEOIDCN)
+
+```
+
+```{r}
+label_map <- c(
+  "Educational_Services" = "Educational Services",
+  "Health_Care" = "Health Care",
+  "Others" = "Daily Living",
+  "LQ_Educational_Services" = "Educational Services",
+  "LQ_Health_Care" = "Health Care",
+  "LQ_Others" = "Daily Living",
+  "combined_score_health"="Health Care",
+  "combined_score_educ"= "Educational Services",
+  "combined_score_others"="Daily Living"
+)
+
+category_colors <- c(
+  "Daily Living" = "steelblue",
+  "Health Care" = "forestgreen",
+  "Educational Services" = "firebrick"
+)
+
+# Step 2: Prepare non-LQ data
+df_non_LQ <- df %>%
+  select(Year, Health_Care, Educational_Services, Others) %>%
+  group_by(Year) %>%
+  summarise(across(everything(), ~ mean(.x, na.rm = TRUE))) %>%
+  pivot_longer(cols = -Year, names_to = "Category", values_to = "Value") %>%
+  mutate(Category = label_map[Category])
+
+# Step 3: Prepare LQ data
+df_LQ <- df %>%
+  select(Year, starts_with("LQ_")) %>%
+  group_by(Year) %>%
+  summarise(across(everything(), ~ mean(.x, na.rm = TRUE))) %>%
+  pivot_longer(cols = -Year, names_to = "Category", values_to = "Value") %>%
+  mutate(Category = label_map[Category])
+
+df_care<- care%>%select(Year,starts_with("combined_score_")) %>%
+  group_by(Year) %>%
+  summarise(across(everything(), ~ mean(.x, na.rm = TRUE))) %>%
+  pivot_longer(cols = -Year, names_to = "Category", values_to = "Value") %>%
+  mutate(Category = label_map[Category])
+
+
+# Step 4: Plot non-LQ
+p1 <- ggplot(df_non_LQ, aes(x = Year, y = Value, color = Category)) +
+  geom_line(size = 1.2) +
+  geom_point() +
+  scale_color_manual(values = category_colors) +
+  labs(title = "", x = "Year", y = "Average Value Gini Coefficient") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+# Step 5: Plot LQ
+p2 <- ggplot(df_LQ, aes(x = Year, y = Value, color = Category)) +
+  geom_line(size = 1.2) +
+  geom_point() +
+  scale_color_manual(values = category_colors) +
+  labs(title = "", x = "Year", y = "Average LQ Value") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+# Step 5: Plot LQ
+p3 <- ggplot(df_care, aes(x = Year, y = Value, color = Category)) +
+  geom_line(size = 1.2) +
+  geom_point() +
+  scale_color_manual(values = category_colors) +
+  labs(title = "", x = "Year", y = "Average CaRES Value") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+library(patchwork)
+
+
+combined <- (p1 + p2 + p3) +
+  plot_annotation(tag_levels = 'a', tag_prefix = "(", tag_suffix = ")")+
+  plot_layout(guides = "collect") &  # collect guides into one shared legend
+  theme(
+    legend.position = "bottom",
+    legend.title = element_text(size = 13, face = "bold"),
+    legend.text = element_text(size = 12)
+  )
+
+ggsave("GINI Paper/Draft/Figures/gini_lq_timeseries.png", plot = combined, width = 10, height = 4, dpi = 300)
+
+```
+
+# calculating CARE for every 5 years.
+```{r}
+# High combined_score = high inequality + low LQ
+library(dplyr)
+
+DF <- df %>%
+  mutate(
+    Year_Group = case_when(
+      Year >= 2009 & Year <= 2013 ~ "2009–2013",
+      Year >= 2014 & Year <= 2018 ~ "2014–2018",
+      Year >= 2019 & Year <= 2021 ~ "2019–2021",  # Update if only up to 2021
+      TRUE ~ NA_character_  # Catch any values outside defined ranges
+    )
+  ) %>%
+  group_by(Year_Group, GEOIDCN) %>%  # group by year group and geography if needed
+  summarise(
+    Health_Care = mean(Health_Care, na.rm = TRUE),
+    LQ_Health_Care = mean(LQ_Health_Care, na.rm = TRUE),
+    Educational_Services = mean(Educational_Services, na.rm = TRUE),
+    LQ_Educational_Services = mean(LQ_Educational_Services, na.rm = TRUE),
+    Others = mean(Others, na.rm = TRUE),
+    LQ_Others = mean(LQ_Others, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    # Standardize Gini and LQ for Health Care
+    z_gini_health = scale(Health_Care),
+    z_lq_health = scale(LQ_Health_Care),
+    combined_score_health = z_gini_health - z_lq_health,
+
+    # Standardize Gini and LQ for Education
+    z_gini_educ = scale(Educational_Services),
+    z_lq_educ = scale(LQ_Educational_Services),
+    combined_score_educ = z_gini_educ - z_lq_educ,
+    
+    # Standardize Gini and LQ for Others
+    z_gini_others = scale(Others),
+    z_lq_others = scale(LQ_Others),
+    combined_score_others = z_gini_others - z_lq_others
+  )
+
+
+write.csv(DF,'GINI Paper/Data/ County_every5_CareScore.csv',row.names = FALSE )
+```
+
+# calculating care for every year
+```{r}
+# High combined_score = high inequality + low LQ
+library(dplyr)
+
+DF <- df %>%
+  mutate(
+    Year_Group = case_when(
+      Year >= 2009 & Year <= 2013 ~ "2009–2013",
+      Year >= 2014 & Year <= 2018 ~ "2014–2018",
+      Year >= 2019 & Year <= 2021 ~ "2019–2021",  # Update if only up to 2021
+      TRUE ~ NA_character_  # Catch any values outside defined ranges
+    )
+  ) %>%
+  group_by(Year, GEOIDCN) %>%  # group by year group and geography if needed
+  summarise(
+    Health_Care = mean(Health_Care, na.rm = TRUE),
+    LQ_Health_Care = mean(LQ_Health_Care, na.rm = TRUE),
+    Educational_Services = mean(Educational_Services, na.rm = TRUE),
+    LQ_Educational_Services = mean(LQ_Educational_Services, na.rm = TRUE),
+    Others = mean(Others, na.rm = TRUE),
+    LQ_Others = mean(LQ_Others, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    # Standardize Gini and LQ for Health Care
+    z_gini_health = scale(Health_Care),
+    z_lq_health = scale(LQ_Health_Care),
+    combined_score_health = z_gini_health - z_lq_health,
+
+    # Standardize Gini and LQ for Education
+    z_gini_educ = scale(Educational_Services),
+    z_lq_educ = scale(LQ_Educational_Services),
+    combined_score_educ = z_gini_educ - z_lq_educ,
+    
+    # Standardize Gini and LQ for Others
+    z_gini_others = scale(Others),
+    z_lq_others = scale(LQ_Others),
+    combined_score_others = z_gini_others - z_lq_others
+  )
+
+
+write.csv(DF,'GINI Paper/Data/ County_everyyear_CareScore.csv',row.names = FALSE )
+```
+
+# visualize it to see the z score data
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+df<-read.csv('County_GINI_LQ.csv')
+df$GEOID <- sprintf("%05s",df$GEOIDCN)
+
+# Reshape the data to long format
+df_long <- df %>%
+  select(combined_score_health, combined_score_educ, combined_score_others) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "Sector",
+    values_to = "CombinedScore"
+  ) %>%
+  mutate(
+    Sector = case_when(
+      Sector == "combined_score_health" ~ "Health Care",
+      Sector == "combined_score_educ" ~ "Educational Services",
+      Sector == "combined_score_others" ~ "Others"
+    )
+  )
+
+test <-df_long %>%filter(CombinedScore[,1]>0)%>%filter(Sector =="Others")
+nrow(test)
+# Plot the density
+ggplot(df_long, aes(x = CombinedScore, fill = Sector, color = Sector)) +
+  geom_histogram() +
+  labs(
+    title = "Density Plot of Combined Inequality and Resource Scores",
+    x = "Combined Score (Z_Gini - Z_LQ)",
+    y = "Density",
+    fill = "Sector",
+    color = "Sector"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "top",
+    text = element_text(size = 12)
+  )
+
+```
+
+# multi bivrate map testing for health (Figure 1)
+```{r}
+library(biscale)
+library(cowplot)
+library(ggplot2)
+library(tidyverse)
+library(tidycensus)
+library(tigris)       # for loading US county shapefiles
+library(sf)           # for spatial joins and geometry
+library(biscale)      # for bi_class()
+options(tigris_use_cache = TRUE)
+
+library(dplyr)
+library(sf)
+library(biscale)
+library(ggplot2)
+library(patchwork)  # for combining plots
+
+# Dataset of US counties with Alaska and Hawaii shifted and re-scaled
+data(county_laea)
+
+# Define the columns for which you want to calculate the mean
+mean_cols <- c(
+  "Health_Care", 
+  "Educational_Services", 
+  "Others", 
+  "LQ_Educational_Services", 
+  "LQ_Health_Care", 
+  "LQ_Others"
+)
+
+# Group by GEOID and calculate means
+df_mean <- df %>%
+  group_by(GEOID) %>%
+  summarise(across(all_of(mean_cols), ~ mean(.x, na.rm = TRUE), .names = "mean_{.col}")) %>%
+  ungroup()
+
+# ---- Create 3 bi_classified dataframes ----
+
+# Health Care
+df_health <- bi_class(df_mean, x = mean_Health_Care, y = mean_LQ_Health_Care, style = "quantile", dim = 3) %>%
+  left_join(county_laea, ., by = "GEOID")
+
+# Education
+df_educ <- bi_class(df_mean, x = mean_Educational_Services, y = mean_LQ_Educational_Services, style = "quantile", dim = 3) %>%
+  left_join(county_laea, ., by = "GEOID")
+
+# Others
+df_others <- bi_class(df_mean, x = mean_Others, y = mean_LQ_Others, style = "quantile", dim = 3) %>%
+  left_join(county_laea, ., by = "GEOID")
+
+# ---- Plotting function ----
+make_map <- function(data, title) {
+  ggplot() +
+    geom_sf(data = data, aes(fill = bi_class), color = NA, size = 0.1) +
+    bi_scale_fill(pal = "DkCyan", dim = 3) +
+    labs(title = title, fill = "bi_class") +
+    theme_void() +
+    theme(
+      legend.position = "bottom",
+      legend.direction = "horizontal",
+      legend.key.height = unit(0.4, "cm"),
+      legend.key.width = unit(2, "cm"),
+      legend.title = element_text(size = 10),
+      legend.text = element_text(size = 8),
+        plot.title = element_text(hjust = 0, size = 14, face = "bold")  # ← hjust = 0 = left
+    ) 
+}
+
+# ---- Create each plot ----
+p_health <- make_map(df_health, "(a)")
+p_educ <- make_map(df_educ, "(b)")
+p_others <- make_map(df_others, "(c)")
+legend_shared <- make_legend(df_health)
+
+legend <- bi_legend(pal = "DkCyan",
+                    dim = 3,
+                    xlab = "Higher Gini",
+                    ylab = "Higher LQ",
+                    size = 8)
+
+
+
+prow <-cowplot::plot_grid(
+  cowplot::plot_grid(p_health+ theme(legend.position="none"), 
+                     p_educ+ theme(legend.position="none"), 
+                     p_others+ theme(legend.position="none"), ncol = 1, align = "v"),
+  legend_shared,
+  ncol = 1,
+  rel_heights = c(1, 0.1)
+)
+
+
+plot_grid(prow,legend , ncol = 1, rel_heights = c(1, .1))
+
+
+
+
+# Overlay the legend in the top right (coordinates: left, bottom, right, top)
+final_plot <- prow +
+  inset_element(legend, left = 0.8, bottom = 0.75, right = 0.98, top = 0.98)
+
+# Display
+final_plot
+
+ggsave("GINI Paper/Draft/Figures/bi_class_map2009_2021.png", plot = final_plot, width = 10, height = 12, dpi = 300)
+
+```
+
