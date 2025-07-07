@@ -1,7 +1,5 @@
 # Care-Resource-Equity-Score-CaRES-
 
-# Spatial Analysis of Care Resource Distribution
-
 This repository contains code used to compute and visualize measures of inequality and clustering in the distribution of formal care labor resources across U.S. counties. It includes scripts to calculate the **Care Resource Equity Score (CaRES)** using the Gini coefficient and Location Quotient (LQ), and to conduct Local Indicators of Spatial Association (LISA) analysis.
 
 ## Files and Descriptions
